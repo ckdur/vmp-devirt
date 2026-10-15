@@ -24,10 +24,13 @@ push-button devirtualizer:
   the values.
 - VMP 1.x/2.x front-ends are heuristic scanners; their old static
   walkers are kept as cross-check oracles, not primary paths.
-- x86-32 ELF (VMP 3.x on Linux) is supported for `scan`, `mine` and
-  `mine-emu` only: section-stripped ELFs map via PT_LOAD, decoding follows
-  the ELF class (PE stays 64-bit, bit-for-bit). The snapshot harness,
-  tracer tools and Remill lift are still x64/PE-only.
+- x86-32 ELF (VMP 3.x on Linux): `scan`, `mine`, `mine-emu`, the
+  `trace_elf32` live tracer and `lift32` (Remill `--arch x86`).
+  Section-stripped ELFs map via PT_LOAD; decoding follows the ELF class
+  (PE stays 64-bit, bit-for-bit). The PE snapshot harness
+  (`harness/snapshot.rs`, `trace_open_fetch`) remains x64/PE-only.
+  `trace_elf32` uses host-side libc stubs; see its header for the
+  documented harness lies.
 
 ## Layout
 
@@ -50,14 +53,19 @@ src/
   backend/
     value_cryptor.rs   ADD/SUB/XOR/ROL/ROR/NOT/NEG/... chains
     lifter.rs          iced-x86 text lift + Remill subprocess backend
-    llvm_pipeline.rs   opt -O3 over Remill IR (real passes)
+    llvm_pipeline.rs   opt -O3 over Remill IR (real passes); foldable
+                       intrinsics, flat-memory + State-local analysis view
+    linearize.rs       x86-32 executed handler path -> contiguous bytes
   harness/
     snapshot.rs        Unicorn snapshots: sections+scratch mapping,
                        IN hooks, import stubs, watch hits, memlog,
                        zero-slide fast-forward
 tests/
   smoke.rs             synthetic PE64 + hand-built fetch chain (no fixtures)
+  elf32.rs             synthetic section-less ELF32 + x86-32 chain
 tools/                 (analysis drivers; each documents its inputs)
+  trace_elf32.rs       i386 ELF live tracer: dispatches, decrypted
+                       operands, handler paths (input of `lift32`)
 scripts/               Triton/angr/Ghidra helpers (external deps)
 ```
 
@@ -93,6 +101,8 @@ link check runs as a non-blocking CI job (needs LLVM 22).
 | `DEVIRT` / `FORCE_EDGE` / `REPO_ROOT` | `./target/…` / `.` | script-called binaries + repo root |
 | `VMP_WORK_DIR` | system temp | lift scratch |
 | `EFLAGS` / `IN_RET` / `DLL_MAIN` | — | snapshot state variants |
+| `FETCH_MAX_DISP` | `0` | ELF32 scan: admit `[reg±disp]` fetches |
+| `BOUND` / `TSC` / `ARGV` / `LOG` / `LOG_READS` / `POKE` / `TRACE_DUMP` | see `tools/trace_elf32.rs` | `trace_elf32` run control |
 
 ## Method (3.x, the proven path)
 

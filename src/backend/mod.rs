@@ -15,3 +15,4 @@ pub mod synth;
 pub mod brighten;
 pub mod mba;
 pub mod fetch;
+pub mod linearize;

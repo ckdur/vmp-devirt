@@ -88,6 +88,13 @@ pub fn remill_bin() -> String {
 /// errors only when a configured binary is missing or the lift fails
 /// (a bare fallback name is still attempted via PATH at spawn time).
 pub fn lift_via_remill(bytes: &[u8], va: u64) -> Result<LiftedHandler> {
+    lift_via_remill_arch(bytes, va, "amd64")
+}
+
+/// [`lift_via_remill`] for a Remill `--arch` (`amd64`, `x86`); the local
+/// re-decode follows the arch width. `--os linux` is added for `x86`
+/// (i386 ELF targets); amd64 keeps the historic argument list.
+pub fn lift_via_remill_arch(bytes: &[u8], va: u64, arch: &str) -> Result<LiftedHandler> {
     let bin = remill_bin();
     if let Ok(p) = std::env::var("REMILL_LIFT") {
         if !std::path::Path::new(&p).exists() {
@@ -95,20 +102,23 @@ pub fn lift_via_remill(bytes: &[u8], va: u64) -> Result<LiftedHandler> {
         }
     }
     let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    let out = std::process::Command::new(&bin)
-        .args([
-            "--arch", "amd64",
-            "--bytes", &hex,
-            "--address", &format!("{:#x}", va),
-            "--ir_out", "/dev/stdout",
-        ])
-        .output()?;
+    let mut args: Vec<String> = vec![
+        "--arch".into(), arch.into(),
+        "--bytes".into(), hex,
+        "--address".into(), format!("{:#x}", va),
+        "--ir_out".into(), "/dev/stdout".into(),
+    ];
+    if arch == "x86" {
+        args.extend(["--os".into(), "linux".into()]);
+    }
+    let out = std::process::Command::new(&bin).args(&args).output()?;
     if !out.status.success() {
         anyhow::bail!("remill-lift failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     let ir = String::from_utf8_lossy(&out.stdout).into_owned();
     // Re-decode locally for insn count so downstream keeps working.
-    let mut decoder = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE);
+    let bits = if arch.starts_with("x86") { 32 } else { 64 };
+    let mut decoder = Decoder::with_ip(bits, bytes, va, DecoderOptions::NONE);
     let mut insns = Vec::new();
     while decoder.can_decode() && insns.len() < 32 {
         let ins = decoder.decode();

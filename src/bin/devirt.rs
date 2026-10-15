@@ -16,6 +16,7 @@ fn main() -> Result<()> {
         eprintln!("  devirt scan <binary>            # detect version + list fetch/handler addrs");
         eprintln!("  devirt mine <binary> <site-va>  # mine cryptor chain at a fetch site");
         eprintln!("  devirt mine-emu <binary> <entry-va>...  # emulate 256 inputs: concrete chain + verify");
+        eprintln!("  devirt lift32 <binary> <paths.jsonl> <outdir> [--limit N] [--opaque-memory]  # x86-32: linearize handler paths -> remill -> opt -> llc");
         eprintln!("  devirt merge <trace...>         # union edges + divergence points (.bin u64LE)");
         eprintln!("  devirt map <op...>              # opcode -> handler type (hex bytes)");
         eprintln!("  devirt sense <trace> <memlog>  # behavior-ranked fetch candidates");
@@ -114,6 +115,109 @@ fn main() -> Result<()> {
                     Err(e) => println!("entry {:#x} error: {}", va, e),
                 }
             }
+        }
+        "lift32" => {
+            // Input: trace_elf32 paths.jsonl ({"handler":va,"insns":[va..]}).
+            // Needs remill-lift (REMILL_LIFT) plus `opt`/`llc` on PATH.
+            if args.len() < 5 {
+                eprintln!("lift32 needs <paths.jsonl> <outdir>");
+                std::process::exit(2);
+            }
+            use vmp_devirt::backend::linearize::linearize_path32;
+            use vmp_devirt::backend::lifter::lift_via_remill_arch;
+            use vmp_devirt::backend::llvm_pipeline::{define_flat_memory, define_pure_intrinsics, optimize_remill_ir, wrap_state_local};
+            // Remill's opaque memory model is kept with --opaque-memory;
+            // default is the flat analysis view (define_flat_memory +
+            // wrap_state_local: result function @handler_<va>).
+            let flat = !args.iter().any(|a| a == "--opaque-memory");
+            let bin = bin.as_ref().unwrap();
+            anyhow::ensure!(bin.decode_bits() == 32, "lift32 wants a 32-bit binary");
+            let outdir = &args[4];
+            std::fs::create_dir_all(outdir)?;
+            let limit: usize = args.iter().position(|a| a == "--limit")
+                .and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+            let map = bin.section_map()?;
+            let read = |va: u64, n: usize| -> Option<Vec<u8>> {
+                // Short reads at a mapping edge are fine for decoding.
+                (1..=n).rev().find_map(|k| bin.read_via(&map, va, k))
+            };
+            // Body of `define ... @<name>(` (instruction lines only).
+            let body_of = |ir: &str, name: &str| -> Vec<String> {
+                let head = format!("@{}(", name);
+                let mut inside = false;
+                let mut b = Vec::new();
+                for l in ir.lines() {
+                    if l.starts_with("define") && l.contains(&head) { inside = true; continue; }
+                    if inside {
+                        if l.starts_with('}') { break; }
+                        if l.starts_with("  ") && !l.trim_start().starts_with(';') { b.push(l.to_string()); }
+                    }
+                }
+                b
+            };
+            // Guest-memory accesses: flat = load/store through a GEP chain
+            // rooted at @__vm_mem; opaque = remill memory intrinsic calls.
+            let mem_ops = |body: &[String]| -> (usize, usize) {
+                let mut vm: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let (mut r, mut w) = (0, 0);
+                for l in body {
+                    let t = l.trim_start();
+                    if t.contains("@__remill_read_memory_") { r += 1; }
+                    if t.contains("@__remill_write_memory_") { w += 1; }
+                    if let Some((lhs, rhs)) = t.split_once(" = ") {
+                        if rhs.starts_with("getelementptr") {
+                            let base = rhs.split(", ").nth(1).and_then(|x| x.strip_prefix("ptr ")).unwrap_or("");
+                            if base == "@__vm_mem" || vm.contains(base) { vm.insert(lhs.to_string()); }
+                        } else if rhs.starts_with("load ") {
+                            let p = rhs.split(", ").nth(1).and_then(|x| x.strip_prefix("ptr ")).unwrap_or("");
+                            if vm.contains(p) { r += 1; }
+                        }
+                    } else if t.starts_with("store ") {
+                        let p = t.split(", ").nth(1).and_then(|x| x.strip_prefix("ptr ")).unwrap_or("");
+                        if vm.contains(p) { w += 1; }
+                    }
+                }
+                (r, w)
+            };
+            let mut summary = String::from("handler\tx86_in\tx86_out\tllvm_insns\tmem_reads\tmem_writes\tobj\tstatus\n");
+            let (mut ok, mut fail, mut objs) = (0usize, 0usize, 0usize);
+            let text = std::fs::read_to_string(&args[3]).with_context(|| format!("read {}", args[3]))?;
+            for line in text.lines().take(limit) {
+                let v: serde_json::Value = serde_json::from_str(line)?;
+                let path: Vec<u64> = v["insns"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
+                let va = v["handler"].as_u64().unwrap_or(0);
+                let res = (|| -> anyhow::Result<(usize, usize, usize, usize, usize, bool)> {
+                    let lin = linearize_path32(&path, &read)?;
+                    let lifted = lift_via_remill_arch(&lin.bytes, lin.va, "x86")?;
+                    let ir = define_pure_intrinsics(&lifted.ir_before);
+                    let ir = if flat { wrap_state_local(&define_flat_memory(&ir), lin.va)? } else { ir };
+                    let opt = optimize_remill_ir(&ir, lin.va)?;
+                    let ll = format!("{}/h_{:08x}.ll", outdir, va);
+                    std::fs::write(&ll, &opt)?;
+                    let obj = format!("{}/h_{:08x}.o", outdir, va);
+                    let llc = std::process::Command::new("llc")
+                        .args(["-filetype=obj", "-relocation-model=pic", &ll, "-o", &obj]).output()?;
+                    let fname = if flat { format!("handler_{:x}", lin.va) } else { format!("sub_{:x}", lin.va) };
+                    let body = body_of(&opt, &fname);
+                    anyhow::ensure!(!body.is_empty(), "no @{} in optimized IR", fname);
+                    let (reads, writes) = mem_ops(&body);
+                    Ok((lin.insns_in, lin.insns_out, body.len(), reads, writes, llc.status.success()))
+                })();
+                match res {
+                    Ok((xi, xo, li, r, w, o)) => {
+                        ok += 1;
+                        if o { objs += 1; }
+                        summary.push_str(&format!("{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\tok\n", va, xi, xo, li, r, w, o));
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        let msg = format!("{}", e).replace(['\n', '\t'], " ");
+                        summary.push_str(&format!("{:#x}\t{}\t\t\t\t\t\terror: {}\n", va, path.len(), &msg[..msg.len().min(160)]));
+                    }
+                }
+            }
+            std::fs::write(format!("{}/summary.tsv", outdir), &summary)?;
+            println!("lift32: {} lifted+optimized ({} objects), {} failed -> {}/summary.tsv", ok, objs, fail, outdir);
         }
         other if other == "merge" => {
             if args.len() < 4 {

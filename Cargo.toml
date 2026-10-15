@@ -35,6 +35,10 @@ name = "trace_open_fetch"
 path = "tools/trace_open_fetch.rs"
 
 [[bin]]
+name = "trace_elf32"
+path = "tools/trace_elf32.rs"
+
+[[bin]]
 name = "force_edge"
 path = "tools/force_edge.rs"
 
