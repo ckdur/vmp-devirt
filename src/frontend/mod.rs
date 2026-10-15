@@ -6,6 +6,7 @@
 
 pub mod fetch_finder;
 pub mod cryptor_miner;
+pub mod emu_miner;
 pub mod site_emulator;
 pub mod handler_classifier;
 pub mod classifier_legacy;

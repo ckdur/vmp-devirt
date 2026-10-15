@@ -65,6 +65,15 @@ pub fn mine_cryptor_with(
     site: &FetchSite,
     read: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
 ) -> Result<MinedCryptor> {
+    mine_cryptor_with_bits(site, read, 64)
+}
+
+/// [`mine_cryptor_with`] decoding at `bits` (64 historic, 32 for x86-32).
+pub fn mine_cryptor_with_bits(
+    site: &FetchSite,
+    read: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    bits: u32,
+) -> Result<MinedCryptor> {
     use std::collections::HashSet;
     let dst8 = low8_of(site.dst);
     let mut cryptor = ValueCryptor::new(CryptSize::Byte);
@@ -84,7 +93,7 @@ pub fn mine_cryptor_with(
     // chain_verify judges consistency downstream.
     let mut start_va = site.va;
     if let Some(code) = read(site.va, 32) {
-        let mut d = Decoder::with_ip(64, &code, site.va, DecoderOptions::NONE);
+        let mut d = Decoder::with_ip(bits, &code, site.va, DecoderOptions::NONE);
         for _ in 0..4 {
             if !d.can_decode() {
                 break;
@@ -121,7 +130,7 @@ pub fn mine_cryptor_with(
             Some(b) => b,
             None => continue,
         };
-        let mut decoder = Decoder::with_ip(64, &code, ip, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(bits, &code, ip, DecoderOptions::NONE);
         let dump = std::env::var("MINER_DUMP").is_ok();
         let mut first = ip == site.va;
         let mut first_in_path = true;
@@ -147,7 +156,7 @@ pub fn mine_cryptor_with(
                     // cryptors): follow direct jumps once; true terminal
                     // dispatch jumps land in code with no dst8 chain ops
                     // and simply yield nothing further.
-                    if depth < 1 && ins.op_count() == 1 && ins.op0_kind() == OpKind::NearBranch64 {
+                    if depth < 1 && ins.op_count() == 1 && matches!(ins.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32) {
                         let tgt = ins.near_branch_target();
                         if tgt != 0 && !visited.contains(&tgt) {
                             worklist.push((tgt, depth + 1));
@@ -157,7 +166,7 @@ pub fn mine_cryptor_with(
                 }
                 Mnemonic::Call => {
                     // Call-hidden cryptor (3.9.4): follow one level.
-                    if depth < 1 && ins.op_count() == 1 && ins.op0_kind() == OpKind::NearBranch64 {
+                    if depth < 1 && ins.op_count() == 1 && matches!(ins.op0_kind(), OpKind::NearBranch64 | OpKind::NearBranch32) {
                         let tgt = ins.near_branch_target();
                         if tgt != 0 && !visited.contains(&tgt) {
                             worklist.push((tgt, depth + 1));
@@ -240,8 +249,10 @@ pub fn mine_cryptor_with(
 
 /// File-backed mining (static bytes). For runtime-decrypted regions use
 /// [`mine_cryptor_with`] with a snapshot overlay reader.
+/// Decodes at the binary's [`decode_bits`](crate::pe_loader::PEBinary::decode_bits)
+/// (PE: 64 as before; 32-bit ELF: 32).
 pub fn mine_cryptor(site: &FetchSite, binary: &crate::pe_loader::PEBinary) -> Result<MinedCryptor> {
-    mine_cryptor_with(site, &|va, n| binary.read_bytes(va, n).ok())
+    mine_cryptor_with_bits(site, &|va, n| binary.read_bytes(va, n).ok(), binary.decode_bits())
 }
 
 impl MinedCryptor {

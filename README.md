@@ -24,6 +24,10 @@ push-button devirtualizer:
   the values.
 - VMP 1.x/2.x front-ends are heuristic scanners; their old static
   walkers are kept as cross-check oracles, not primary paths.
+- x86-32 ELF (VMP 3.x on Linux) is supported for `scan`, `mine` and
+  `mine-emu` only: section-stripped ELFs map via PT_LOAD, decoding follows
+  the ELF class (PE stays 64-bit, bit-for-bit). The snapshot harness,
+  tracer tools and Remill lift are still x64/PE-only.
 
 ## Layout
 
@@ -36,6 +40,7 @@ src/
     mod.rs             VmFrontend trait (detect/fetch_stream/handler_addrs)
     fetch_finder.rs    movzx-byte FDJ scan + watchset/snapshot helpers
     cryptor_miner.rs   per-site ValueCryptor mining (branch-following)
+    emu_miner.rs       emulation-backed mining: concrete operands, verified
     site_emulator.rs   sample-specific oracle decoders (legacy)
     handler_classifier.rs  handler classification via legacy patterns
     classifier_legacy.rs   first-bytes patterns (weak; fallback only)

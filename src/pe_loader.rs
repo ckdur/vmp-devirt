@@ -231,6 +231,12 @@ impl PEBinary {
             Ok(self.parse_manual()?.image_base)
         } else {
             let elf = self.parse_elf()?;
+            if !elf_has_alloc_sections(&elf) {
+                return elf_load_segments(&elf).iter()
+                    .map(|s| s.0)
+                    .min()
+                    .context("no ELF sections or PT_LOAD segments");
+            }
             elf.section_headers.iter()
                 .filter(|sh| sh.sh_addr != 0 && sh.sh_size != 0)
                 .map(|sh| sh.sh_addr)
@@ -262,6 +268,19 @@ impl PEBinary {
             anyhow::bail!("Invalid VA: 0x{:x}", va)
         } else {
             let elf = self.parse_elf()?;
+            if !elf_has_alloc_sections(&elf) {
+                // Section-stripped ELF: map via PT_LOAD (memsz beyond
+                // filesz is zero-fill, refused like NOBITS).
+                for (vaddr, off, filesz, memsz, _) in elf_load_segments(&elf) {
+                    if va >= vaddr && va < vaddr + memsz {
+                        if va + size as u64 > vaddr + filesz {
+                            anyhow::bail!("VA {:#x}+{:#x} exceeds file backing", va, size)
+                        }
+                        return Ok(off + (va - vaddr) as usize);
+                    }
+                }
+                anyhow::bail!("Invalid VA: 0x{:x}", va)
+            }
             for sh in &elf.section_headers {
                 if sh.sh_addr == 0 || sh.sh_size == 0 {
                     continue;
@@ -316,6 +335,54 @@ impl PEBinary {
         }
     }
 
+    /// Instruction-decode bitness for VMP front-ends.
+    /// PE stays 64 (historic path, bit-for-bit with the golden table);
+    /// ELF follows its class, so 32-bit ELF code decodes as 32-bit.
+    pub fn decode_bits(&self) -> u32 {
+        match self.fmt {
+            BinFmt::Pe => 64,
+            BinFmt::Elf => match self.parse_elf() {
+                Ok(e) if !e.is_64 => 32,
+                _ => 64,
+            },
+        }
+    }
+
+    /// ELF executable regions with file backing: (name, va, bytes).
+    /// Uses SHF_EXECINSTR sections, or PF_X PT_LOAD segments (named
+    /// `loadN`) when the section table is stripped (packed loaders).
+    pub fn elf_exec_regions(&self) -> Result<Vec<(String, u64, Vec<u8>)>> {
+        let elf = self.parse_elf()?;
+        let mut out = Vec::new();
+        if elf_has_alloc_sections(&elf) {
+            for sh in &elf.section_headers {
+                if sh.sh_addr == 0 || sh.sh_size == 0
+                    || sh.sh_type == goblin::elf::section_header::SHT_NOBITS
+                    || sh.sh_flags & goblin::elf::section_header::SHF_EXECINSTR as u64 == 0
+                {
+                    continue;
+                }
+                let (o, n) = (sh.sh_offset as usize, sh.sh_size as usize);
+                let end = o.saturating_add(n).min(self.data.len());
+                if o < end {
+                    let name = elf.shdr_strtab[sh.sh_name].to_string();
+                    out.push((name, sh.sh_addr, self.data[o..end].to_vec()));
+                }
+            }
+        } else {
+            for (i, (vaddr, off, filesz, _, flags)) in elf_load_segments(&elf).into_iter().enumerate() {
+                if flags & goblin::elf::program_header::PF_X == 0 || filesz == 0 {
+                    continue;
+                }
+                let end = off.saturating_add(filesz as usize).min(self.data.len());
+                if off < end {
+                    out.push((format!("load{}", i), vaddr, self.data[off..end].to_vec()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Read u64 from VA (little-endian)
     pub fn read_u64(&self, va: u64) -> Result<u64> {
         let bytes = self.read_bytes(va, 8)?;
@@ -340,6 +407,12 @@ impl PEBinary {
             Ok(out)
         } else {
             let elf = self.parse_elf()?;
+            if !elf_has_alloc_sections(&elf) {
+                return Ok(elf_load_segments(&elf).into_iter()
+                    .filter(|s| s.2 > 0)
+                    .map(|(vaddr, off, filesz, _, _)| (vaddr, vaddr + filesz, off))
+                    .collect());
+            }
             let mut out = Vec::new();
             for sh in &elf.section_headers {
                 if sh.sh_addr == 0 || sh.sh_size == 0
@@ -382,6 +455,13 @@ impl PEBinary {
             Ok(out)
         } else {
             let elf = self.parse_elf()?;
+            if !elf_has_alloc_sections(&elf) {
+                return Ok(elf_load_segments(&elf).into_iter().enumerate()
+                    .map(|(i, (vaddr, off, filesz, memsz, _))| {
+                        (format!("load{}", i), vaddr, off, filesz as usize, memsz as usize)
+                    })
+                    .collect());
+            }
             let mut out = Vec::new();
             for sh in &elf.section_headers {
                 if sh.sh_addr == 0 || sh.sh_size == 0 {
@@ -395,6 +475,21 @@ impl PEBinary {
             Ok(out)
         }
     }
+}
+
+/// True when the ELF has a usable section table (ALLOC sections with
+/// addresses). Packed loaders strip it; mapping then falls back to
+/// PT_LOAD segments. ELFs with sections keep the old section path.
+fn elf_has_alloc_sections(elf: &goblin::elf::Elf) -> bool {
+    elf.section_headers.iter().any(|sh| sh.sh_addr != 0 && sh.sh_size != 0)
+}
+
+/// PT_LOAD segments as (vaddr, file_off, filesz, memsz, p_flags).
+fn elf_load_segments(elf: &goblin::elf::Elf) -> Vec<(u64, usize, u64, u64, u32)> {
+    elf.program_headers.iter()
+        .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD && ph.p_memsz != 0)
+        .map(|ph| (ph.p_vaddr, ph.p_offset as usize, ph.p_filesz, ph.p_memsz, ph.p_flags))
+        .collect()
 }
 
 /// Standard toolchain sections (never VM containers).

@@ -5,6 +5,9 @@
 //! for real bytecode fetches (the `mov r10d,0x...` after fetch). This is the
 //! Rust port of the Python prefix-aware scanner that produced
 //! `fetch_sites_all2.json` (152 sites).
+//!
+//! `*_bits` variants decode x86-32 (32-bit GPR bases) and optionally admit
+//! `[reg±disp]` fetches; the plain functions keep the historic x64 rule.
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
@@ -20,7 +23,9 @@ pub struct FetchSite {
     pub len: usize,
 }
 
-fn is_movzx_byte_mem(ins: &Instruction) -> bool {
+/// Byte-load fetch shape with |disp| <= `max_disp` (0 = historic rule).
+/// 32-bit VMP builds fetch with small displacements (`[edi-1]`).
+fn is_movzx_byte_mem_disp(ins: &Instruction, max_disp: i64) -> bool {
     // movzx OR movsx: SMC flips the opcode bit (B6<->BE) between static
     // and live bytes; low8 chain semantics are identical.
     if ins.mnemonic() != Mnemonic::Movzx && ins.mnemonic() != Mnemonic::Movsx { return false; }
@@ -31,7 +36,13 @@ fn is_movzx_byte_mem(ins: &Instruction) -> bool {
     if ins.memory_size().size() != 1 { return false; }
     // base must be a GPR, no index, no scale, disp 0
     if ins.memory_index() != Register::None { return false; }
-    if ins.memory_displacement64() != 0 { return false; }
+    if max_disp == 0 {
+        if ins.memory_displacement64() != 0 { return false; }
+    } else {
+        // 32-bit mode zero-extends displacement64; sign-extend disp32.
+        let disp = ins.memory_displacement32() as i32 as i64;
+        if disp.unsigned_abs() > max_disp as u64 { return false; }
+    }
     if ins.memory_base() == Register::None { return false; }
     true
 }
@@ -42,24 +53,35 @@ fn is_movzx_byte_mem(ins: &Instruction) -> bool {
 /// size 0x266238 in `vmp_test_suite_virt_all_394.vmp.exe`). `image_base` is
 /// the VA of `data[0]`.
 pub fn scan_fetch_sites(data: &[u8], image_base: u64) -> Vec<FetchSite> {
+    scan_fetch_sites_bits(data, image_base, 64, 0)
+}
+
+/// Bitness-aware scan: `bits` = 64 (historic) or 32 (x86-32, base must
+/// be a 32-bit GPR). `max_disp` admits `[reg+disp]` with |disp| <= it
+/// (0 = historic disp-free rule).
+pub fn scan_fetch_sites_bits(data: &[u8], image_base: u64, bits: u32, max_disp: i64) -> Vec<FetchSite> {
     let mut sites = Vec::new();
     let mut off = 0usize;
     while off + 3 < data.len() {
         // Try decode at off (with REX handling). iced_x86 will correctly consume REX.
-        let mut decoder = Decoder::with_ip(64, &data[off..], image_base + off as u64, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(bits, &data[off..], image_base + off as u64, DecoderOptions::NONE);
         let ins = decoder.decode();
-        if is_movzx_byte_mem(&ins) {
+        if is_movzx_byte_mem_disp(&ins, max_disp) {
             // Validate: within next 4 insns there is a new `mov r32,imm32` or `movzx` that loads a constant
             // is *not* required for correctness but filters garbage 622 -> 152 (we keep it optional here).
             // For the Rust scanner we keep the strict REX-aware rule and emit if base is GPR.
             let dst = ins.op0_register();
             let base = ins.memory_base();
-            // Only 64-bit GPRs allowed as base for bytecode ptr.
-            let is_gpr = matches!(base,
+            // Only native-width GPRs allowed as base for bytecode ptr.
+            let is_gpr = if bits == 32 {
+                matches!(base,
+                    Register::EAX | Register::ECX | Register::EDX | Register::EBX |
+                    Register::ESP | Register::EBP | Register::ESI | Register::EDI)
+            } else { matches!(base,
                 Register::RAX | Register::RCX | Register::RDX | Register::RBX |
                 Register::RSP | Register::RBP | Register::RSI | Register::RDI |
                 Register::R8 | Register::R9 | Register::R10 | Register::R11 |
-                Register::R12 | Register::R13 | Register::R14 | Register::R15);
+                Register::R12 | Register::R13 | Register::R14 | Register::R15) };
             if is_gpr {
                 sites.push(FetchSite { va: ins.ip(), base, dst, len: ins.len() });
             }
@@ -74,12 +96,17 @@ pub fn scan_fetch_sites(data: &[u8], image_base: u64) -> Vec<FetchSite> {
 /// Strict variant that also checks for a following `mov reg,imm` within 4 insns,
 /// matching the Python `fetch_sites_all2.json` filter.
 pub fn scan_fetch_sites_strict(data: &[u8], image_base: u64) -> Vec<FetchSite> {
-    let all = scan_fetch_sites(data, image_base);
+    scan_fetch_sites_strict_bits(data, image_base, 64, 0)
+}
+
+/// Bitness-aware strict scan (see [`scan_fetch_sites_bits`]).
+pub fn scan_fetch_sites_strict_bits(data: &[u8], image_base: u64, bits: u32, max_disp: i64) -> Vec<FetchSite> {
+    let all = scan_fetch_sites_bits(data, image_base, bits, max_disp);
     let mut strict = Vec::new();
     for site in all {
         let off = (site.va - image_base) as usize;
         // Look ahead up to 64 bytes / 6 insns for a mov reg,imm32.
-        let mut decoder = Decoder::with_ip(64, &data[off + site.len ..], site.va + site.len as u64, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(bits, &data[off + site.len ..], site.va + site.len as u64, DecoderOptions::NONE);
         let mut found = false;
         for _ in 0..6 {
             if usize::try_from(decoder.ip() - image_base).unwrap_or(usize::MAX) >= data.len() { break; }

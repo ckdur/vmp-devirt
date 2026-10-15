@@ -15,6 +15,7 @@ fn main() -> Result<()> {
         eprintln!("usage:");
         eprintln!("  devirt scan <binary>            # detect version + list fetch/handler addrs");
         eprintln!("  devirt mine <binary> <site-va>  # mine cryptor chain at a fetch site");
+        eprintln!("  devirt mine-emu <binary> <entry-va>...  # emulate 256 inputs: concrete chain + verify");
         eprintln!("  devirt merge <trace...>         # union edges + divergence points (.bin u64LE)");
         eprintln!("  devirt map <op...>              # opcode -> handler type (hex bytes)");
         eprintln!("  devirt sense <trace> <memlog>  # behavior-ranked fetch candidates");
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
             let bin = bin.as_ref().unwrap();
             let bytes = bin.read_bytes(va, 16)?;
             let mut d = iced_x86::Decoder::with_ip(
-                64,
+                bin.decode_bits(),
                 &bytes,
                 va,
                 iced_x86::DecoderOptions::NONE,
@@ -89,6 +90,30 @@ fn main() -> Result<()> {
             };
             let m = mine_cryptor(&site, &bin)?;
             println!("site {:#x} key={} aux={:?} steps={} {:?}", va, m.key_reg, m.aux_src, m.steps, m.cryptor.cmds);
+        }
+        "mine-emu" => {
+            if args.len() < 4 {
+                eprintln!("mine-emu needs one or more entry VAs (hex): handler entry or fetch site");
+                std::process::exit(2);
+            }
+            use vmp_devirt::frontend::emu_miner::{image_of, mine_cryptor_emu};
+            let bin = bin.as_ref().unwrap();
+            let bits = bin.decode_bits();
+            let image = image_of(bin)?;
+            for a in &args[3..] {
+                let va = u64::from_str_radix(a.trim_start_matches("0x"), 16)?;
+                match mine_cryptor_emu(&image, va, bits) {
+                    Ok(m) => {
+                        println!("entry {:#x} fetch {:#x} vip={} key={} update {:#x} verified={} entry_independent={} steps={} {:?}",
+                            va, m.fetch_va, m.vip_reg, m.key_reg, m.key_update_va, m.verified,
+                            m.entry_independent, m.cryptor.cmds.len(), m.cryptor.cmds);
+                        for u in &m.unmodeled {
+                            println!("  unmodeled {}", u);
+                        }
+                    }
+                    Err(e) => println!("entry {:#x} error: {}", va, e),
+                }
+            }
         }
         other if other == "merge" => {
             if args.len() < 4 {

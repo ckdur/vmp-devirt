@@ -313,3 +313,41 @@ slots in 55 files, all `rsp+0 w=4 rd+wr`** — uniform VM stack-top
 (.rdata/.pdata/.reloc/.buildid; .text/.data/VMP sections excluded —
 SMC/IAT-stale, same caveat as Pushan S1). RSP-symbolic slots need no
 concrete RSP; RSP+huge offsets rejected as dynamic indices.
+
+## x86-32 ELF (VMP 3.x on Linux): fetch mining
+
+Target: a reconstructed (unpacked) VMP 3.x x86-32 ELF, plus its packed
+original (no section table → PT_LOAD mapping). Not distributed. Ground
+truth: `scripts/fetch_oracle32.py` emulates every executed handler entry
+from an external trace (467 entries; 224 reach fetch + key mix + rolling
+key update) for all 256 input bytes. Register roles are randomized per
+VM (VIP seen in EBP/ESI/EDI, key BL), and earlier dword fetches can roll
+the key, so the oracle records the live key per input.
+
+```bash
+devirt scan <elf>                        # vmp3-fdj applies=true
+FETCH_MAX_DISP=8 devirt scan <elf>       # admit [reg±disp] fetches
+python3 -I scripts/fetch_oracle32.py <elf> trace*.json > oracle.json
+python3 -I scripts/score_miners.py target/release/devirt <elf> oracle.json
+```
+
+| Measure | Result |
+|---|---|
+| `scan` unpacked / packed, disp 0 | 2209 / 1114 strict sites |
+| `scan` unpacked / packed, `FETCH_MAX_DISP=8` | 4161 / 2090 strict sites |
+| static `mine` @ oracle fetch site (219 sites) | 19 match, 170 wrong, 30 no chain |
+| `mine-emu` @ handler entry (224) | 216 match+verified, 8 match flagged unverified, 0 wrong |
+| `mine-emu` @ fetch site (224) | 51 match+verified, 0 wrong+verified; 7 match / 18 wrong flagged unverified; 53 missed-fetch, 93 emulation errors, 2 no chain |
+
+Why static mining fails here: mutation inserts ops whose operands exist
+only at run time (`xor al,cl` with a junk-computed `cl`, `adc`/`sbb` with
+a known CF, chains continued across several jmps/calls). `mine-emu`
+records each op with its concrete operand and checks itself (shadow model
+per insn, 256-input reproduction, a second pass from a perturbed entry
+state: other pointer values incl. high bits, stack fill, flags).
+Start at the **handler entry**: fetches are often indexed by registers set
+before them (`[esi+ecx-X]`); started at the fetch, the load misses the
+bytecode and is now rejected (`missed fetch`) instead of silently mining
+the next handler. The 8 flagged entries use VM context (e.g. the handler
+base register) that only a live trace provides. Static `scan` hits are
+not handler entries, so the strict scan's sites seed, not replace, traces.
