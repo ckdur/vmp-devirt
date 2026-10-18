@@ -34,20 +34,26 @@ LLVM 22** — llvm-sys rejects other majors.
 ```bash
 export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm@22
 export PATH=/opt/homebrew/opt/llvm@22/bin:$PATH     # `opt` used by llvm_pipeline.rs
-export REMILL_LIFT=/Users/ckdur/Documents/PIU/remill/build-llvm17/bin/lift/remill-lift-17
+export REMILL_LIFT=/Users/ckdur/Documents/PIU/remill/build-llvm22/bin/lift/remill-lift-22
 cargo build --release --features llvm
 ```
 
 ### Remill
 
-- Remill is invoked **only as a subprocess** (`lifter.rs::lift_via_remill`:
-  `--arch amd64 --bytes <hex> --address <va> --ir_out /dev/stdout`); the
-  textual IR is piped to `opt -O3`. No library linking.
-- Local Remill lives in `../remill`, built against **LLVM 17**
-  (`build-llvm17/`). That is fine: LLVM 22/23 `opt` parses its IR
-  (verified). No need to port Remill to LLVM 22.
-- `remill_bin()` only auto-probes `remill-lift-22`, `remill-lift`,
-  `remill-lift-6.0` on PATH, so `REMILL_LIFT` must be set for the `-17` binary.
+- Remill is invoked **only as a subprocess** (`lifter.rs::lift_via_remill_arch`:
+  `--arch amd64|x86 --bytes <hex> --address <va> --ir_out /dev/stdout`,
+  plus `--os linux` for x86); the textual IR is piped to `opt -O3`. No
+  library linking.
+- Local Remill lives in `../remill` with two builds: `build-llvm22/`
+  (`remill-lift-22`, preferred: same LLVM as `opt`/`llc`) and
+  `build-llvm17/` (`remill-lift-17`; LLVM 22/23 `opt` parses its IR).
+  Both reuse `../remill/dependencies/install` (XED/glog/gflags/sleigh,
+  LLVM-independent). Rebuild 22: `cmake -G Ninja -B build-llvm22
+  "-DCMAKE_PREFIX_PATH=$PWD/dependencies/install;/opt/homebrew/opt/llvm@22"
+  -DCMAKE_BUILD_TYPE=Release && ninja -C build-llvm22` (plain
+  `ninja ... remill-lift-22` skips the semantics `.bc`; the lifter then crashes).
+- `remill_bin()` auto-probes `remill-lift-22`, `remill-lift`,
+  `remill-lift-6.0` on PATH; otherwise set `REMILL_LIFT`.
 
 ## Rules that matter
 
@@ -100,7 +106,11 @@ cargo build --release --features llvm
   (`define_flat_memory` + `wrap_state_local`, function `@handler_<va>`);
   `--opaque-memory` keeps Remill's memory model. The flat view is for
   reading/analysis, not replay.
-- Local Remill (LLVM 17 build) emits the x86 sync hyper call (`cpuid`)
-  with an all-NUL callee name; `define_pure_intrinsics` renames it.
+- Local Remill (`../remill`) is patched (`bin/lift/Lift.cpp`: the sync
+  hyper call was renamed via a dangling `StringRef`, giving `cpuid`/`rdtsc`
+  an all-NUL callee) and also built against LLVM 22:
+  `REMILL_LIFT=/Users/ckdur/Documents/PIU/remill/build-llvm22/bin/lift/remill-lift-22`
+  (`build-llvm17/` still works). `define_pure_intrinsics` keeps a rename
+  fallback for unpatched builds.
 - `cargo test` covers the ELF32 path with synthetic fixtures only
   (`tests/elf32.rs`, `backend/linearize.rs` tests).

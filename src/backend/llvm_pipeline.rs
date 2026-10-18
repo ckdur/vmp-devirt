@@ -35,9 +35,11 @@ fn regex_free_nul_name(ir: &str) -> Option<String> {
 /// becomes an `alwaysinline` definition, so `opt` deletes dead flag junk.
 /// Memory, jump, call and hypercall intrinsics stay opaque.
 ///
-/// Also repairs a local remill-lift (LLVM 17 build) defect: the x86 sync
-/// hyper call (`cpuid`, id 258, ...) is emitted with an all-NUL callee
-/// name that `opt` rejects; it is renamed `@__remill_sync_hyper_call`.
+/// Also repairs output of unpatched remill-lift builds: `bin/lift/Lift.cpp`
+/// renamed the sync hyper call through a dangling `StringRef`, so `cpuid`,
+/// `rdtsc`, ... got an all-NUL callee name that `opt` rejects; it is renamed
+/// `@__remill_sync_hyper_call`. Fixed in the local Remill checkout; kept for
+/// other builds (no-op on fixed output).
 pub fn define_pure_intrinsics(ir: &str) -> String {
     let nul_name = regex_free_nul_name(ir);
     let ir: std::borrow::Cow<str> = match &nul_name {
